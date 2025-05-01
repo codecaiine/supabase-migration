@@ -367,7 +367,6 @@ def generate_diff_for_environment(schemas: Optional[List[str]] = None, env_name:
         return False
     
     output_dir = "migrations"
-
     # Create migrations directory if it doesn't exist
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     
