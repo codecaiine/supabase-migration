@@ -183,30 +183,52 @@ class SupabaseSchemaMigration:
                 if db_password:
                     print(f"Trying direct database connection for {self.env_name}...")
                     
-                    # Construct database URL based on environment
-                    # For Supabase, the database URL pattern is: 
-                    # postgresql://postgres.[project-ref]:[password]@aws-0-[region].pooler.supabase.com:5432/postgres
-                    db_url = f"postgresql://postgres.{self.project_id}:{db_password}@aws-0-us-west-1.pooler.supabase.com:5432/postgres"
-                    
-                    # For local development, you might need:
-                    # db_url = f"postgresql://postgres:{db_password}@db.{self.project_id}.supabase.co:5432/postgres"
-                    
-                    cmd = [
-                        "supabase", "db", "dump",
-                        "--data-only=false",  # Exclude data, only get schema
-                        "--db-url", db_url
+                    # Try different database URL formats
+                    db_urls = [
+                        # Format 1: Direct database URL (most common)
+                        f"postgresql://postgres:{db_password}@db.{self.project_id}.supabase.co:5432/postgres",
+                        
+                        # Format 2: Pooler URL with project prefix
+                        f"postgresql://postgres.{self.project_id}:{db_password}@aws-0-us-west-1.pooler.supabase.com:5432/postgres",
+                        
+                        # Format 3: Alternative pooler format
+                        f"postgresql://postgres:{db_password}@aws-0-us-west-1.pooler.supabase.com:5432/postgres?options=project%3D{self.project_id}"
                     ]
                     
-                    # Add schema filter if specified
-                    if self.schemas:
-                        cmd.extend(["-s", ",".join(self.schemas)])
+                    # Try DATABASE_URL from environment if it exists
+                    if os.getenv("DATABASE_URL"):
+                        db_urls.insert(0, os.getenv("DATABASE_URL"))
                     
-                    # Add output file
-                    cmd.extend(["-f", temp_output])
+                    success = False
+                    for db_url in db_urls:
+                        try:
+                            masked_url = db_url.replace(db_password, "*" * 8)
+                            print(f"Trying database URL format: {masked_url}")
+                            
+                            cmd = [
+                                "supabase", "db", "dump",
+                                "--data-only=false",  # Exclude data, only get schema
+                                "--db-url", db_url
+                            ]
+                            
+                            # Add schema filter if specified
+                            if self.schemas:
+                                cmd.extend(["-s", ",".join(self.schemas)])
+                            
+                            # Add output file
+                            cmd.extend(["-f", temp_output])
+                            
+                            print(f"Running command with database URL...")
+                            result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
+                            print(f"Successfully connected with database URL format.")
+                            success = True
+                            break
+                        except subprocess.CalledProcessError as e:
+                            print(f"Failed with this format: {e.stderr}")
+                            continue
                     
-                    print(f"Running command with database URL...")
-                    result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
-                    print("Successfully connected with database URL.")
+                    if not success:
+                        raise Exception("All database URL formats failed")
                     
                 else:
                     # Try with linked project (requires project to be linked)
