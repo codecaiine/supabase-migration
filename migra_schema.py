@@ -165,59 +165,75 @@ class SupabaseSchemaMigration:
             return False
         
         try:
-            # Get database password from environment
-            db_password = os.environ.get(f"SUPABASE_DB_PASSWORD_{self.env_name.upper()}")
-            if not db_password:
-                print(f"Warning: SUPABASE_DB_PASSWORD_{self.env_name.upper()} not found in environment")
-                print("Trying with linked project...")
-                use_db_url = False
-            else:
-                use_db_url = True
-            
             # Use supabase db dump command to get schema
             temp_output = os.path.join(self.temp_dir, f"schema_{self.env_name}.sql")
             
             print("Extracting schema using Supabase CLI...")
             
-            # Build the command
-            cmd = [
-                "supabase", "db", "dump",
-                "--data-only=false",  # Exclude data, only get schema
-            ]
-            
-            if use_db_url:
-                # Use direct database URL
-                db_url = f"postgresql://postgres:{db_password}@db.{self.project_id}.supabase.co:5432/postgres"
-                cmd.extend(["--db-url", db_url])
-                print("Using direct database connection...")
-            else:
-                # Try with linked project
-                print("Using linked project...")
-            
-            # Add schema filter if specified
-            if self.schemas:
-                cmd.extend(["-s", ",".join(self.schemas)])
-            
-            # Add output file
-            cmd.extend(["-f", temp_output])
-            
-            # Debug: print the command (hide password)
-            debug_cmd = cmd.copy()
-            if use_db_url and "--db-url" in debug_cmd:
-                db_url_index = debug_cmd.index("--db-url")
-                debug_cmd[db_url_index + 1] = f"postgresql://postgres:****@db.{self.project_id}.supabase.co:5432/postgres"
-            print(f"Running command: {' '.join(debug_cmd)}")
+            # Get the service role key and DB password for authentication
+            service_role_key = os.environ.get(f"SUPABASE_SERVICE_ROLE_KEY_{self.env_name.upper()}")
+            db_password = os.environ.get(f"SUPABASE_DB_PASSWORD_{self.env_name.upper()}")
             
             # Start loading spinner
             spinner = LoadingSpinner("Extracting schema")
             spinner.start()
             
             try:
-                # Run the command with timeout
-                result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
-                print(f"Command stdout: {result.stdout}")
-                if result.stderr:
-                    print(f"Command stderr: {result.stderr}")
+                # First try with database URL (direct connection)
+                if db_password:
+                    print(f"Trying direct database connection for {self.env_name}...")
+                    
+                    # Construct database URL based on environment
+                    # For Supabase, the database URL pattern is: 
+                    # postgresql://postgres.[project-ref]:[password]@aws-0-[region].pooler.supabase.com:5432/postgres
+                    db_url = f"postgresql://postgres.{self.project_id}:{db_password}@aws-0-us-west-1.pooler.supabase.com:5432/postgres"
+                    
+                    # For local development, you might need:
+                    # db_url = f"postgresql://postgres:{db_password}@db.{self.project_id}.supabase.co:5432/postgres"
+                    
+                    cmd = [
+                        "supabase", "db", "dump",
+                        "--data-only=false",  # Exclude data, only get schema
+                        "--db-url", db_url
+                    ]
+                    
+                    # Add schema filter if specified
+                    if self.schemas:
+                        cmd.extend(["-s", ",".join(self.schemas)])
+                    
+                    # Add output file
+                    cmd.extend(["-f", temp_output])
+                    
+                    print(f"Running command with database URL...")
+                    result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
+                    print("Successfully connected with database URL.")
+                    
+                else:
+                    # Try with linked project (requires project to be linked)
+                    print(f"Trying with linked project...")
+                    
+                    cmd = [
+                        "supabase", "db", "dump",
+                        "--data-only=false",  # Exclude data, only get schema
+                        "--linked"  # Use linked project
+                    ]
+                    
+                    # Add schema filter if specified
+                    if self.schemas:
+                        cmd.extend(["-s", ",".join(self.schemas)])
+                    
+                    # Add output file
+                    cmd.extend(["-f", temp_output])
+                    
+                    # Set up environment variables for the command
+                    env = os.environ.copy()
+                    if service_role_key:
+                        env["SUPABASE_ACCESS_TOKEN"] = service_role_key
+                    
+                    print(f"Running command with linked project...")
+                    result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300, env=env)
+                    print("Successfully connected with linked project.")
+                
             except subprocess.TimeoutExpired:
                 print("ERROR: Command timed out after 300 seconds")
                 spinner.stop()
@@ -227,15 +243,19 @@ class SupabaseSchemaMigration:
                 print(f"Error output: {e.stderr}")
                 spinner.stop()
                 
-                # If direct connection failed, try with debug
-                if use_db_url:
-                    print("\nTrying with debug flag...")
-                    debug_cmd = cmd + ["--debug"]
-                    try:
-                        debug_result = subprocess.run(debug_cmd, capture_output=True, text=True)
-                        print(f"Debug output: {debug_result.stderr}")
-                    except:
-                        pass
+                # Provide helpful error messages
+                if "Tenant or user not found" in str(e.stderr):
+                    print("\nERROR: Database connection failed - User not found")
+                    print("Please check:")
+                    print(f"1. The database password in SUPABASE_DB_PASSWORD_{self.env_name.upper()}")
+                    print(f"2. The project ID '{self.project_id}' is correct")
+                    print("3. The database URL format matches your Supabase instance")
+                elif "not logged in" in str(e.stderr):
+                    print("\nERROR: Not logged in to Supabase CLI")
+                    print("Please run: supabase login")
+                elif "project not linked" in str(e.stderr):
+                    print("\nERROR: Project not linked")
+                    print(f"Please run: supabase link --project-ref {self.project_id}")
                 
                 return False
             finally:
@@ -248,13 +268,16 @@ class SupabaseSchemaMigration:
                 with open(temp_output, 'r', encoding='utf-8') as f:
                     content = f.read()
                     print(f"File size: {len(content)} bytes")
-                    print(f"First 500 characters: {content[:500]}")
                     
                     # Debug: check for specific table names
                     print("\nChecking for CREATE TABLE statements:")
+                    table_count = 0
                     for line in content.split('\n'):
                         if 'CREATE TABLE' in line:
                             print(f"Found: {line.strip()}")
+                            table_count += 1
+                            if table_count >= 5:  # Show only first 5 tables
+                                break
             else:
                 print(f"ERROR: Temporary file not created at {temp_output}")
                 return False
