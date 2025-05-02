@@ -165,6 +165,15 @@ class SupabaseSchemaMigration:
             return False
         
         try:
+            # Get database password from environment
+            db_password = os.environ.get(f"SUPABASE_DB_PASSWORD_{self.env_name.upper()}")
+            if not db_password:
+                print(f"Warning: SUPABASE_DB_PASSWORD_{self.env_name.upper()} not found in environment")
+                print("Trying with linked project...")
+                use_db_url = False
+            else:
+                use_db_url = True
+            
             # Use supabase db dump command to get schema
             temp_output = os.path.join(self.temp_dir, f"schema_{self.env_name}.sql")
             
@@ -173,9 +182,17 @@ class SupabaseSchemaMigration:
             # Build the command
             cmd = [
                 "supabase", "db", "dump",
-                "--linked",  # Use linked project
-                "--data-only=false"  # Exclude data, only get schema
+                "--data-only=false",  # Exclude data, only get schema
             ]
+            
+            if use_db_url:
+                # Use direct database URL
+                db_url = f"postgresql://postgres:{db_password}@db.{self.project_id}.supabase.co:5432/postgres"
+                cmd.extend(["--db-url", db_url])
+                print("Using direct database connection...")
+            else:
+                # Try with linked project
+                print("Using linked project...")
             
             # Add schema filter if specified
             if self.schemas:
@@ -184,16 +201,63 @@ class SupabaseSchemaMigration:
             # Add output file
             cmd.extend(["-f", temp_output])
             
+            # Debug: print the command (hide password)
+            debug_cmd = cmd.copy()
+            if use_db_url and "--db-url" in debug_cmd:
+                db_url_index = debug_cmd.index("--db-url")
+                debug_cmd[db_url_index + 1] = f"postgresql://postgres:****@db.{self.project_id}.supabase.co:5432/postgres"
+            print(f"Running command: {' '.join(debug_cmd)}")
+            
             # Start loading spinner
             spinner = LoadingSpinner("Extracting schema")
             spinner.start()
             
             try:
-                # Run the command
-                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                # Run the command with timeout
+                result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
+                print(f"Command stdout: {result.stdout}")
+                if result.stderr:
+                    print(f"Command stderr: {result.stderr}")
+            except subprocess.TimeoutExpired:
+                print("ERROR: Command timed out after 300 seconds")
+                spinner.stop()
+                return False
+            except subprocess.CalledProcessError as e:
+                print(f"Error running command: {e}")
+                print(f"Error output: {e.stderr}")
+                spinner.stop()
+                
+                # If direct connection failed, try with debug
+                if use_db_url:
+                    print("\nTrying with debug flag...")
+                    debug_cmd = cmd + ["--debug"]
+                    try:
+                        debug_result = subprocess.run(debug_cmd, capture_output=True, text=True)
+                        print(f"Debug output: {debug_result.stderr}")
+                    except:
+                        pass
+                
+                return False
             finally:
                 # Stop the spinner
                 spinner.stop()
+            
+            # Add debug to check if file was created and its content
+            if os.path.exists(temp_output):
+                print(f"Temporary file created: {temp_output}")
+                with open(temp_output, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    print(f"File size: {len(content)} bytes")
+                    print(f"First 500 characters: {content[:500]}")
+                    
+                    # Debug: check for specific table names
+                    print("\nChecking for CREATE TABLE statements:")
+                    for line in content.split('\n'):
+                        if 'CREATE TABLE' in line:
+                            print(f"Found: {line.strip()}")
+            else:
+                print(f"ERROR: Temporary file not created at {temp_output}")
+                return False
             
             # Read the temporary file and write to final destination with headers
             with open(temp_output, 'r', encoding='utf-8') as temp_file:
@@ -261,6 +325,8 @@ END $$;
             return False
         except Exception as e:
             print(f"Unexpected error: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def _remove_migration_history(self, schema_content: str) -> str:
@@ -408,6 +474,8 @@ def generate_multi_environment_migrations(schemas: Optional[List[str]] = None, c
         
     except Exception as e:
         print(f"Error processing {env['name']} environment: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
